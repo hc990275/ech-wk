@@ -1,0 +1,346 @@
+name: Build Magisk Module for ECH Workers
+
+on:
+  workflow_dispatch: # 手动触发
+  push:
+    tags:
+      - 'v*' # 推送v开头的tag时触发
+  release:
+    types: [published] # 发布Release时触发
+
+env:
+  MODULE_NAME: "ECH-Workers-Magisk"
+  MODULE_ID: "ech_workers"
+  MODULE_VERSION: "1.0.0"
+  MODULE_VERSION_CODE: "1"
+
+jobs:
+  build-module:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        arch: [arm64, arm, x64]
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Setup build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y zip wget curl jq
+        
+    - name: Create module directory structure
+      run: |
+        mkdir -p dist/${{ env.MODULE_NAME }}/META-INF/com/google/android
+        mkdir -p dist/${{ env.MODULE_NAME }}/system/bin
+        mkdir -p dist/${{ env.MODULE_NAME }}/system/etc
+        mkdir -p dist/${{ env.MODULE_NAME }}/bin/${{ matrix.arch }}
+        
+    - name: Download binary for ${{ matrix.arch }}
+      run: |
+        ARCH=${{ matrix.arch }}
+        if [ "$ARCH" = "arm64" ]; then
+          URL="https://github.com/byJoey/ech-wk/releases/download/latest/ECHWorkers-linux-arm64-softrouter.tar.gz"
+          BIN_NAME="ech-workers-arm64"
+        elif [ "$ARCH" = "arm" ]; then
+          URL="https://github.com/byJoey/ech-wk/releases/download/latest/ECHWorkers-linux-arm-softrouter.tar.gz"
+          BIN_NAME="ech-workers-arm"
+        elif [ "$ARCH" = "x64" ]; then
+          URL="https://github.com/byJoey/ech-wk/releases/download/latest/ECHWorkers-linux-amd64-softrouter.tar.gz"
+          BIN_NAME="ech-workers-x64"
+        fi
+        
+        echo "Downloading binary for $ARCH from $URL"
+        wget -q "$URL" -O /tmp/ech-$ARCH.tar.gz
+        tar -xzf /tmp/ech-$ARCH.tar.gz -C /tmp/
+        
+        # 假设解压后的二进制文件名为 ech-workers
+        if [ -f "/tmp/ech-workers" ]; then
+          cp /tmp/ech-workers "dist/${{ env.MODULE_NAME }}/bin/$ARCH/$BIN_NAME"
+          chmod +x "dist/${{ env.MODULE_NAME }}/bin/$ARCH/$BIN_NAME"
+          echo "Binary downloaded and prepared for $ARCH"
+        else
+          echo "Warning: Could not find extracted binary for $ARCH"
+          # 创建空文件作为占位符
+          touch "dist/${{ env.MODULE_NAME }}/bin/$ARCH/$BIN_NAME"
+        fi
+        
+    - name: Create Magisk module files
+      run: |
+        MOD_DIR="dist/${{ env.MODULE_NAME }}"
+        
+        # 1. 创建 module.prop
+        cat > "$MOD_DIR/module.prop" << EOF
+id=${{ env.MODULE_ID }}
+name=${{ env.MODULE_NAME }}
+version=${{ env.MODULE_VERSION }}
+versionCode=${{ env.MODULE_VERSION_CODE }}
+author=AutoBuild
+description=Cloudflare ECH Workers Proxy - Auto-built Magisk Module
+support=https://github.com/byJoey/ech-wk
+minMagisk=24000
+EOF
+        
+        # 2. 创建 service.sh (核心脚本，处理配置文件链接)
+        cat > "$MOD_DIR/service.sh" << 'EOF'
+#!/system/bin/sh
+# 自动生成的 ECH Workers 服务脚本
+MODDIR=${0%/*}
+LOG_FILE="/data/adb/ech_workers_service.log"
+CONF_SOURCE="/system/etc/ech-workers.conf"
+LINK_TARGET="/data/media/0/Android/ech-workers.conf"
+
+# 记录日志
+log_info() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+# 等待系统启动完成
+log_info "等待系统启动..."
+while [ "$(getprop sys.boot_completed)" != "1" ]; do
+    sleep 2
+done
+sleep 8 # 额外等待内部存储挂载
+log_info "系统启动完成。"
+
+# 创建配置链接
+if [ -f "$CONF_SOURCE" ]; then
+    rm -f "$LINK_TARGET"
+    if ln -sf "$CONF_SOURCE" "$LINK_TARGET"; then
+        log_info "成功创建配置链接: $LINK_TARGET"
+        chmod 644 "$CONF_SOURCE" 2>/dev/null
+    else
+        log_info "错误: 创建链接失败"
+    fi
+else
+    log_info "警告: 源配置文件不存在"
+fi
+
+# 启动 ECH Workers 服务（可选）
+if [ -x "/system/bin/ech-workers" ]; then
+    if ! pgrep -f "ech-workers" > /dev/null; then
+        log_info "启动 ECH Workers 服务..."
+        nohup /system/bin/ech-workers -config "$CONF_SOURCE" >/dev/null 2>&1 &
+    fi
+fi
+EOF
+        chmod +x "$MOD_DIR/service.sh"
+        
+        # 3. 创建 post-fs-data.sh
+        cat > "$MOD_DIR/post-fs-data.sh" << 'EOF'
+#!/system/bin/sh
+# 创建命令行工具链接
+if [ -f "/data/adb/modules/ech_workers/config.sh" ]; then
+    ln -sf /data/adb/modules/ech_workers/config.sh /system/bin/ech-workers-cli
+    chmod 755 /system/bin/ech-workers-cli 2>/dev/null
+fi
+EOF
+        chmod +x "$MOD_DIR/post-fs-data.sh"
+        
+        # 4. 创建 customize.sh (安装脚本)
+        cat > "$MOD_DIR/customize.sh" << 'EOF'
+#!/system/bin/sh
+ui_print "================================"
+ui_print "   ECH Workers Magisk Module"
+ui_print "   版本: $MOD_VER_CODE"
+ui_print "================================"
+
+# 获取设备架构
+ARCH=$(uname -m)
+case $ARCH in
+    aarch64) 
+        ui_print "- 架构: arm64"
+        BIN_SRC="$MODPATH/bin/arm64/ech-workers-arm64"
+        ;;
+    armv7l|armv8l) 
+        ui_print "- 架构: arm"
+        BIN_SRC="$MODPATH/bin/arm/ech-workers-arm"
+        ;;
+    x86_64) 
+        ui_print "- 架构: x64"
+        BIN_SRC="$MODPATH/bin/x64/ech-workers-x64"
+        ;;
+    *) 
+        ui_print "! 不支持的架构: $ARCH"
+        abort "安装终止"
+        ;;
+esac
+
+# 复制二进制文件
+if [ -f "$BIN_SRC" ] && [ -s "$BIN_SRC" ]; then
+    cp -f "$BIN_SRC" "$MODPATH/system/bin/ech-workers"
+    chmod 755 "$MODPATH/system/bin/ech-workers"
+    ui_print "- 二进制文件已安装"
+else
+    ui_print "- 警告: 未找到对应架构的二进制文件"
+    ui_print "- 请手动放置 ech-workers 到 /system/bin/"
+fi
+
+# 创建默认配置文件（如果不存在）
+if [ ! -f "/system/etc/ech-workers.conf" ]; then
+    mkdir -p "$MODPATH/system/etc"
+    cat > "$MODPATH/system/etc/ech-workers.conf" << CONFEOF
+# ECH Workers 配置文件
+# 重启模块生效
+
+BEST_IP="cf.877771.xyz"
+SERVER_ADDR="echo.example.com:443"
+LISTEN_ADDR="127.0.0.1:30001"
+TOKEN=""
+DNS="https://dns.alidns.com/dns-query"
+ECH_DOMAIN="cloudflare-ech.com"
+
+# 提示：修改后重启模块
+CONFEOF
+    ui_print "- 已创建默认配置文件"
+fi
+
+ui_print "- 安装完成！"
+ui_print "- 重启后，配置将链接到: /data/media/0/Android/ech-workers.conf"
+ui_print "================================"
+EOF
+        chmod +x "$MOD_DIR/customize.sh"
+        
+        # 5. 创建 config.sh (命令行工具)
+        cat > "$MOD_DIR/config.sh" << 'EOF'
+#!/system/bin/sh
+CONFIG="/system/etc/ech-workers.conf"
+LOG_FILE="/data/adb/ech_workers_service.log"
+
+case "$1" in
+    "edit")
+        if command -v nano >/dev/null; then
+            nano "$CONFIG"
+        elif command -v vi >/dev/null; then
+            vi "$CONFIG"
+        else
+            echo "未找到文本编辑器"
+            cat "$CONFIG"
+        fi
+        ;;
+    "log")
+        if [ -f "$LOG_FILE" ]; then
+            tail -n 50 "$LOG_FILE"
+        else
+            echo "暂无日志"
+        fi
+        ;;
+    "restart")
+        pkill -f "ech-workers" 2>/dev/null
+        sleep 2
+        nohup /system/bin/ech-workers -config "$CONFIG" >/dev/null 2>&1 &
+        echo "服务已重启"
+        ;;
+    "status")
+        if pgrep -f "ech-workers" >/dev/null; then
+            echo "ECH Workers 正在运行"
+        else
+            echo "ECH Workers 未运行"
+        fi
+        ;;
+    *)
+        echo "ECH Workers 管理工具"
+        echo "用法: ech-workers-cli [命令]"
+        echo "命令:"
+        echo "  edit     编辑配置文件"
+        echo "  log      查看服务日志"
+        echo "  restart  重启服务"
+        echo "  status   查看服务状态"
+        ;;
+esac
+EOF
+        chmod +x "$MOD_DIR/config.sh"
+        
+        # 6. 创建 META-INF 文件
+        cat > "$MOD_DIR/META-INF/com/google/android/update-binary" << 'EOF'
+#!/sbin/sh
+# Magisk 通用安装脚本
+# 不要修改此文件除非你知道你在做什么
+
+OUTFD=$2
+ZIPFILE=$3
+
+ui_print() {
+  echo -e "ui_print $1\nui_print" >> /proc/self/fd/$OUTFD
+}
+
+require_new_magisk() {
+  ui_print "*******************************"
+  ui_print " 请安装 Magisk v20.4+! "
+  ui_print "*******************************"
+  exit 1
+}
+
+# 检查 Magisk 版本
+[ -z $MAGISK_VER_CODE ] && MAGISK_VER_CODE=$(grep_prop MAGISK_VER_CODE /data/adb/magisk/util_functions.sh 2>/dev/null)
+[ -z $MAGISK_VER_CODE ] && require_new_magisk
+[ $MAGISK_VER_CODE -lt 20400 ] && require_new_magisk
+
+# 提取模块文件
+ui_print "- 提取模块文件"
+mkdir -p $MODPATH
+unzip -o "$ZIPFILE" -x 'META-INF/*' -d $MODPATH >&2
+
+# 运行 customize.sh
+[ -f $MODPATH/customize.sh ] && . $MODPATH/customize.sh
+
+# 设置权限
+ui_print "- 设置权限"
+set_permissions
+
+ui_print "- 安装完成"
+exit 0
+EOF
+        chmod +x "$MOD_DIR/META-INF/com/google/android/update-binary"
+        
+        cat > "$MOD_DIR/META-INF/com/google/android/updater-script" << 'EOF'
+#MAGISK
+EOF
+        
+        echo "Magisk module files created successfully"
+        
+  package-module:
+    needs: build-module
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: magisk-module-${{ matrix.arch }}
+        path: artifacts
+        
+    - name: Package final module
+      run: |
+        # 创建一个最终模块目录
+        mkdir -p final-module
+        
+        # 复制第一个架构的文件作为基础
+        cp -r artifacts/arm64/* final-module/ 2>/dev/null || true
+        
+        # 确保所有架构的二进制文件都被包含
+        mkdir -p final-module/bin
+        cp -r artifacts/arm64/bin/* final-module/bin/ 2>/dev/null || true
+        cp -r artifacts/arm/bin/* final-module/bin/ 2>/dev/null || true
+        cp -r artifacts/x64/bin/* final-module/bin/ 2>/dev/null || true
+        
+        # 打包成ZIP
+        cd final-module
+        zip -r9 "../${{ env.MODULE_NAME }}-${{ env.MODULE_VERSION }}.zip" ./*
+        cd ..
+        
+        echo "Module packaged: ${{ env.MODULE_NAME }}-${{ env.MODULE_VERSION }}.zip"
+        
+    - name: Upload module artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.MODULE_NAME }}-${{ env.MODULE_VERSION }}
+        path: ${{ env.MODULE_NAME }}-${{ env.MODULE_VERSION }}.zip
+        
+    - name: Create GitHub Release
+      if: github.event_name == 'release'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: ${{ env.MODULE_NAME }}-${{ env.MODULE_VERSION }}.zip
